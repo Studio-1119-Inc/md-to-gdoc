@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+#
+# md-to-gdoc — Convert Markdown files to Google Docs
+#
+# Usage:
+#   md-to-gdoc <file.md ...> <drive/folder/path>
+#   md-to-gdoc <file.md ...> --folder <drive-folder-id>
+#
+# The folder path is walked from the root of your Google Drive,
+# creating folders as needed. If a doc with the same name already
+# exists in the target folder, it is updated in place (upsert).
+# Cross-file links (e.g. [Setup](SETUP.md)) are rewritten to
+# point to the corresponding Google Doc.
+#
+# Examples:
+#   md-to-gdoc *.md "My Company/Products/Docs"
+#   md-to-gdoc README.md "My Company/Products/Docs"
+#   md-to-gdoc report.md --folder <drive-folder-id>
+#
+# Authentication:
+#   Uses gcloud application-default credentials, falling back to
+#   the active gcloud account. Requires drive scope:
+#
+#   gcloud auth application-default login \
+#     --scopes=https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/cloud-platform
+#
+# Requires: pandoc, gcloud, curl
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# --- Args ---
+MD_FILES=()
+FOLDER_PATH=""
+FOLDER_ID=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --folder)
+            FOLDER_ID="$2"
+            shift 2
+            ;;
+        --version)
+            echo "md-to-gdoc $VERSION"
+            exit 0
+            ;;
+        -h|--help)
+            sed -n '/^#/!q; s/^# \{0,1\}//p' "$0" | tail -n +2
+            exit 0
+            ;;
+        *)
+            if [[ -f "$1" ]]; then
+                MD_FILES+=("$1")
+            elif [[ -z "$FOLDER_PATH" ]]; then
+                FOLDER_PATH="$1"
+            else
+                echo "Error: Unknown argument or file not found: $1"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#MD_FILES[@]} -eq 0 ]]; then
+    echo "Error: No markdown files specified."
+    echo "Usage: md-to-gdoc <file.md ...> <drive/folder/path>"
+    exit 1
+fi
+
+if [[ -z "$FOLDER_PATH" && -z "$FOLDER_ID" ]]; then
+    echo "Error: No target folder specified."
+    echo "Usage: md-to-gdoc <file.md ...> <drive/folder/path>"
+    exit 1
+fi
+
+# --- Check dependencies ---
+if ! command -v pandoc &>/dev/null; then
+    echo "Error: pandoc is not installed. Install with: brew install pandoc"
+    exit 1
+fi
+
+if ! command -v gcloud &>/dev/null; then
+    echo "Error: gcloud is not installed. See https://cloud.google.com/sdk/docs/install"
+    exit 1
+fi
+
+# --- Get auth token ---
+TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null) || \
+TOKEN=$(gcloud auth print-access-token 2>/dev/null) || {
+    echo "Error: gcloud auth failed."
+    echo "Run: gcloud auth application-default login --scopes=https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/cloud-platform"
+    exit 1
+}
+
+QUOTA_PROJECT=$(gcloud config get-value project 2>/dev/null || echo "")
+
+# Build common curl auth headers
+AUTH_HEADERS=(-H "Authorization: Bearer $TOKEN")
+if [[ -n "$QUOTA_PROJECT" ]]; then
+    AUTH_HEADERS+=(-H "x-goog-user-project: $QUOTA_PROJECT")
+fi
+
+# --- Google Drive API helpers ---
+
+# Searches for a folder by name under a parent. Returns folder ID or empty.
+drive_find_folder() {
+    local parent_id="$1"
+    local name="$2"
+    local query="name='${name}' and '${parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+
+    local resp
+    resp=$(curl -s -G \
+        "https://www.googleapis.com/drive/v3/files" \
+        --data-urlencode "q=${query}" \
+        --data-urlencode "fields=files(id)" \
+        "${AUTH_HEADERS[@]}")
+
+    echo "$resp" | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4 || true
+}
+
+# Creates a folder under a parent. Returns new folder ID.
+drive_create_folder() {
+    local parent_id="$1"
+    local name="$2"
+
+    local resp
+    resp=$(curl -s -X POST \
+        "https://www.googleapis.com/drive/v3/files?fields=id" \
+        "${AUTH_HEADERS[@]}" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"${name}\", \"mimeType\": \"application/vnd.google-apps.folder\", \"parents\": [\"${parent_id}\"]}")
+
+    echo "$resp" | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4 || true
+}
+
+# Finds an existing Google Doc by name in a folder. Returns doc ID or empty.
+drive_find_doc() {
+    local parent_id="$1"
+    local name="$2"
+    local query="name='${name}' and '${parent_id}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false"
+
+    local resp
+    resp=$(curl -s -G \
+        "https://www.googleapis.com/drive/v3/files" \
+        --data-urlencode "q=${query}" \
+        --data-urlencode "fields=files(id)" \
+        "${AUTH_HEADERS[@]}")
+
+    echo "$resp" | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4 || true
+}
+
+# --- Resolve folder path ---
+# Walks each segment from Drive root ("root" = user's My Drive root),
+# creating folders that don't exist.
+resolve_folder_path() {
+    local path="$1"
+    local current_id="root"
+
+    IFS='/' read -ra SEGMENTS <<< "$path"
+    for segment in "${SEGMENTS[@]}"; do
+        [[ -z "$segment" ]] && continue
+        local child_id
+        child_id=$(drive_find_folder "$current_id" "$segment")
+        if [[ -z "$child_id" ]]; then
+            echo "  Creating folder: $segment" >&2
+            child_id=$(drive_create_folder "$current_id" "$segment")
+            if [[ -z "$child_id" ]]; then
+                echo "Error: Failed to create folder '$segment'" >&2
+                exit 1
+            fi
+        fi
+        current_id="$child_id"
+    done
+
+    echo "$current_id"
+}
+
+if [[ -n "$FOLDER_PATH" && -z "$FOLDER_ID" ]]; then
+    echo "Resolving folder path: $FOLDER_PATH ..."
+    FOLDER_ID=$(resolve_folder_path "$FOLDER_PATH")
+    echo "  Resolved to folder ID: $FOLDER_ID"
+fi
+
+# --- Upload helpers ---
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+declare -A DOC_IDS
+declare -A DOC_URLS
+
+convert_and_upload() {
+    local md_file="$1"
+    local md_input="$2"
+    local update_id="${3:-}"
+
+    local bname
+    bname=$(basename "$md_file" .md)
+    local docx_file="$TMPDIR/${bname}.docx"
+
+    pandoc "$md_input" -f gfm -t docx -o "$docx_file" --wrap=none
+
+    if [[ ! -f "$docx_file" ]]; then
+        echo "Error: pandoc conversion failed for $md_file"
+        return 1
+    fi
+
+    local doc_title="${bname//-/ }"
+    local response doc_id doc_url doc_name
+
+    # Upsert: check for existing doc by name in target folder
+    if [[ -z "$update_id" && -n "$FOLDER_ID" ]]; then
+        update_id=$(drive_find_doc "$FOLDER_ID" "$doc_title")
+        if [[ -n "$update_id" ]]; then
+            echo "    (updating existing doc)"
+        fi
+    fi
+
+    if [[ -n "$update_id" ]]; then
+        response=$(curl -s -X PATCH \
+            "https://www.googleapis.com/upload/drive/v3/files/${update_id}?uploadType=media&fields=id,name,webViewLink" \
+            "${AUTH_HEADERS[@]}" \
+            -H "Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document" \
+            --data-binary "@${docx_file}")
+    else
+        local metadata="{\"name\": \"${doc_title}\", \"mimeType\": \"application/vnd.google-apps.document\""
+        if [[ -n "$FOLDER_ID" ]]; then
+            metadata="${metadata}, \"parents\": [\"${FOLDER_ID}\"]"
+        fi
+        metadata="${metadata}}"
+
+        response=$(curl -s -X POST \
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink" \
+            "${AUTH_HEADERS[@]}" \
+            -F "metadata=$metadata;type=application/json" \
+            -F "file=@${docx_file};type=application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    fi
+
+    doc_id=$(echo "$response" | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+    doc_url=$(echo "$response" | grep -o '"webViewLink": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+    doc_name=$(echo "$response" | grep -o '"name": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+
+    rm -f "$docx_file"
+
+    if [[ -z "$doc_id" ]]; then
+        echo "Error: Upload failed for $md_file. API response:"
+        echo "$response"
+        return 1
+    fi
+
+    local key
+    key=$(basename "$md_file")
+    DOC_IDS["$key"]="$doc_id"
+    DOC_URLS["$key"]="$doc_url"
+
+    echo "  -> $doc_name: $doc_url"
+}
+
+# --- Pass 1: Upload all files ---
+echo ""
+echo "Pass 1: Uploading files ..."
+
+FAILED=0
+for md_file in "${MD_FILES[@]}"; do
+    echo "  $(basename "$md_file")"
+    convert_and_upload "$md_file" "$md_file" || FAILED=$((FAILED + 1))
+done
+
+if [[ $FAILED -gt 0 ]]; then
+    echo ""
+    echo "Done. ${#MD_FILES[@]} file(s) processed, $FAILED failed."
+    exit 1
+fi
+
+# --- Pass 2: Rewrite cross-file links ---
+NEEDS_REWRITE=false
+SED_ARGS=()
+for key in "${!DOC_URLS[@]}"; do
+    url="${DOC_URLS[$key]}"
+    SED_ARGS+=(-e "s|](\\./${key})|](${url})|g" -e "s|](${key})|](${url})|g")
+done
+
+for md_file in "${MD_FILES[@]}"; do
+    for key in "${!DOC_URLS[@]}"; do
+        if grep -q "(${key})\|(\./${key})" "$md_file" 2>/dev/null; then
+            NEEDS_REWRITE=true
+            break 2
+        fi
+    done
+done
+
+if [[ "$NEEDS_REWRITE" == "true" ]]; then
+    echo ""
+    echo "Pass 2: Rewriting cross-file links ..."
+
+    for md_file in "${MD_FILES[@]}"; do
+        local_key=$(basename "$md_file")
+        doc_id="${DOC_IDS[$local_key]:-}"
+        [[ -z "$doc_id" ]] && continue
+
+        rewritten="$TMPDIR/${local_key}"
+        sed "${SED_ARGS[@]}" "$md_file" > "$rewritten"
+
+        if ! diff -q "$md_file" "$rewritten" &>/dev/null; then
+            echo "  $(basename "$md_file") (updating links)"
+            convert_and_upload "$md_file" "$rewritten" "$doc_id" || true
+        fi
+    done
+fi
+
+echo ""
+echo "Done. ${#MD_FILES[@]} file(s) uploaded."
