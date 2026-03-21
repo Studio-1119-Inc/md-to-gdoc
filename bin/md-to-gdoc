@@ -5,6 +5,7 @@
 # Usage:
 #   md-to-gdoc <file.md ...> <drive/folder/path>
 #   md-to-gdoc <file.md ...> --folder <drive-folder-id>
+#   md-to-gdoc <file.md ...> --account <email> <drive/folder/path>
 #
 # The folder path is walked from the root of your Google Drive,
 # creating folders as needed. If a doc with the same name already
@@ -16,6 +17,7 @@
 #   md-to-gdoc *.md "My Company/Products/Docs"
 #   md-to-gdoc README.md "My Company/Products/Docs"
 #   md-to-gdoc report.md --folder <drive-folder-id>
+#   md-to-gdoc *.md --account user@company.com "My Company/Docs"
 #
 # Authentication:
 #   Uses gcloud application-default credentials, falling back to
@@ -34,11 +36,16 @@ VERSION="1.0.0"
 MD_FILES=()
 FOLDER_PATH=""
 FOLDER_ID=""
+ACCOUNT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --folder)
             FOLDER_ID="$2"
+            shift 2
+            ;;
+        --account)
+            ACCOUNT="$2"
             shift 2
             ;;
         --version)
@@ -86,9 +93,40 @@ if ! command -v gcloud &>/dev/null; then
     exit 1
 fi
 
+# --- Resolve account ---
+if [[ -z "$ACCOUNT" ]]; then
+    ACCOUNTS=()
+    while IFS= read -r acct; do
+        ACCOUNTS+=("$acct")
+    done < <(gcloud auth list --format='value(account)' --filter='status:ACTIVE' 2>/dev/null)
+
+    if [[ ${#ACCOUNTS[@]} -gt 1 ]] && [[ -t 0 ]]; then
+        echo "Multiple Google accounts found:"
+        for i in "${!ACCOUNTS[@]}"; do
+            echo "  $((i + 1))) ${ACCOUNTS[$i]}"
+        done
+        printf "Select account [1-%d]: " "${#ACCOUNTS[@]}"
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ACCOUNTS[@]} )); then
+            ACCOUNT="${ACCOUNTS[$((choice - 1))]}"
+        else
+            echo "Error: Invalid selection."
+            exit 1
+        fi
+    elif [[ ${#ACCOUNTS[@]} -eq 1 ]]; then
+        ACCOUNT="${ACCOUNTS[0]}"
+    fi
+fi
+
 # --- Get auth token ---
+ACCOUNT_FLAG=()
+if [[ -n "$ACCOUNT" ]]; then
+    ACCOUNT_FLAG=(--account "$ACCOUNT")
+    echo "Using account: $ACCOUNT"
+fi
+
 TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null) || \
-TOKEN=$(gcloud auth print-access-token 2>/dev/null) || {
+TOKEN=$(gcloud auth print-access-token "${ACCOUNT_FLAG[@]}" 2>/dev/null) || {
     echo "Error: gcloud auth failed."
     echo "Run: gcloud auth application-default login --scopes=https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/cloud-platform"
     exit 1
