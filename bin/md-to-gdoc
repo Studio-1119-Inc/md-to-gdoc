@@ -30,7 +30,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # --- Args ---
 MD_FILES=()
@@ -237,7 +237,9 @@ convert_and_upload() {
     bname=$(basename "$md_file" .md)
     local docx_file="$TMPDIR/${bname}.docx"
 
-    pandoc "$md_input" -f gfm -t docx -o "$docx_file" --wrap=none
+    local script_dir
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    pandoc "$md_input" -f gfm -t docx -o "$docx_file" --wrap=none --reference-doc="$script_dir/reference.docx"
 
     if [[ ! -f "$docx_file" ]]; then
         echo "Error: pandoc conversion failed for $md_file"
