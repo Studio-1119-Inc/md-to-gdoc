@@ -36,7 +36,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 # --- Args ---
 MD_FILES=()
@@ -143,7 +143,12 @@ TOKEN=$(gcloud auth print-access-token "${ACCOUNT_FLAG[@]}" 2>/dev/null) || {
     exit 1
 }
 
-QUOTA_PROJECT=$(gcloud config get-value project 2>/dev/null || echo "")
+# Drive API requires a quota project. Honour the standard gcloud env vars
+# (CLOUDSDK_CORE_PROJECT, GOOGLE_CLOUD_PROJECT) before falling back to the
+# user's active gcloud config, so a deploy script can pin the project
+# without depending on whatever the operator's `gcloud config` happens to
+# point at.
+QUOTA_PROJECT="${CLOUDSDK_CORE_PROJECT:-${GOOGLE_CLOUD_PROJECT:-$(gcloud config get-value project 2>/dev/null || echo "")}}"
 
 # Build common curl auth headers
 AUTH_HEADERS=(-H "Authorization: Bearer $TOKEN")
