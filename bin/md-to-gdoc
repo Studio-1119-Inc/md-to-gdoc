@@ -7,6 +7,7 @@
 #   md-to-gdoc <file.md ...> --folder <drive-folder-id>
 #   md-to-gdoc <file.md ...> --root <drive-folder-id> <relative/path>
 #   md-to-gdoc <file.md ...> --account <email> <drive/folder/path>
+#   md-to-gdoc --html <file.md ...>
 #
 # By default the folder path is walked from the root of your My Drive,
 # creating folders as needed. Use --root <folder-id> to walk from a
@@ -18,12 +19,17 @@
 # is updated in place (upsert). Cross-file links (e.g. [Setup](SETUP.md))
 # are rewritten to point to the corresponding Google Doc.
 #
+# With --html, files are converted to standalone .html next to the input
+# (no Drive upload, no gcloud required). Cross-file .md links are
+# rewritten to .html.
+#
 # Examples:
 #   md-to-gdoc *.md "My Company/Products/Docs"
 #   md-to-gdoc README.md "My Company/Products/Docs"
 #   md-to-gdoc report.md --folder <drive-folder-id>
 #   md-to-gdoc *.md --root <applications-folder-id> "Trusync/Product"
 #   md-to-gdoc *.md --account user@company.com "My Company/Docs"
+#   md-to-gdoc --html *.md
 #
 # Authentication:
 #   Uses gcloud application-default credentials, falling back to
@@ -36,7 +42,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 
 # --- Args ---
 MD_FILES=()
@@ -44,6 +50,7 @@ FOLDER_PATH=""
 FOLDER_ID=""
 ROOT_FOLDER_ID="root"
 ACCOUNT=""
+HTML_MODE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,6 +65,10 @@ while [[ $# -gt 0 ]]; do
         --account)
             ACCOUNT="$2"
             shift 2
+            ;;
+        --html)
+            HTML_MODE=1
+            shift
             ;;
         --version)
             echo "md-to-gdoc $VERSION"
@@ -87,7 +98,7 @@ if [[ ${#MD_FILES[@]} -eq 0 ]]; then
     exit 1
 fi
 
-if [[ -z "$FOLDER_PATH" && -z "$FOLDER_ID" ]]; then
+if [[ -z "$HTML_MODE" && -z "$FOLDER_PATH" && -z "$FOLDER_ID" ]]; then
     echo "Error: No target folder specified."
     echo "Usage: md-to-gdoc <file.md ...> <drive/folder/path>"
     exit 1
@@ -99,61 +110,63 @@ if ! command -v pandoc &>/dev/null; then
     exit 1
 fi
 
-if ! command -v gcloud &>/dev/null; then
+if [[ -z "$HTML_MODE" ]] && ! command -v gcloud &>/dev/null; then
     echo "Error: gcloud is not installed. See https://cloud.google.com/sdk/docs/install"
     exit 1
 fi
 
-# --- Resolve account ---
-if [[ -z "$ACCOUNT" ]]; then
-    ACCOUNTS=()
-    while IFS= read -r acct; do
-        ACCOUNTS+=("$acct")
-    done < <(gcloud auth list --format='value(account)' --filter='status:ACTIVE' 2>/dev/null)
+if [[ -z "$HTML_MODE" ]]; then
+    # --- Resolve account ---
+    if [[ -z "$ACCOUNT" ]]; then
+        ACCOUNTS=()
+        while IFS= read -r acct; do
+            ACCOUNTS+=("$acct")
+        done < <(gcloud auth list --format='value(account)' --filter='status:ACTIVE' 2>/dev/null)
 
-    if [[ ${#ACCOUNTS[@]} -gt 1 ]] && [[ -t 0 ]]; then
-        echo "Multiple Google accounts found:"
-        for i in "${!ACCOUNTS[@]}"; do
-            echo "  $((i + 1))) ${ACCOUNTS[$i]}"
-        done
-        printf "Select account [1-%d]: " "${#ACCOUNTS[@]}"
-        read -r choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ACCOUNTS[@]} )); then
-            ACCOUNT="${ACCOUNTS[$((choice - 1))]}"
-        else
-            echo "Error: Invalid selection."
-            exit 1
+        if [[ ${#ACCOUNTS[@]} -gt 1 ]] && [[ -t 0 ]]; then
+            echo "Multiple Google accounts found:"
+            for i in "${!ACCOUNTS[@]}"; do
+                echo "  $((i + 1))) ${ACCOUNTS[$i]}"
+            done
+            printf "Select account [1-%d]: " "${#ACCOUNTS[@]}"
+            read -r choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ACCOUNTS[@]} )); then
+                ACCOUNT="${ACCOUNTS[$((choice - 1))]}"
+            else
+                echo "Error: Invalid selection."
+                exit 1
+            fi
+        elif [[ ${#ACCOUNTS[@]} -eq 1 ]]; then
+            ACCOUNT="${ACCOUNTS[0]}"
         fi
-    elif [[ ${#ACCOUNTS[@]} -eq 1 ]]; then
-        ACCOUNT="${ACCOUNTS[0]}"
     fi
-fi
 
-# --- Get auth token ---
-ACCOUNT_FLAG=()
-if [[ -n "$ACCOUNT" ]]; then
-    ACCOUNT_FLAG=(--account "$ACCOUNT")
-    echo "Using account: $ACCOUNT"
-fi
+    # --- Get auth token ---
+    ACCOUNT_FLAG=()
+    if [[ -n "$ACCOUNT" ]]; then
+        ACCOUNT_FLAG=(--account "$ACCOUNT")
+        echo "Using account: $ACCOUNT"
+    fi
 
-TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null) || \
-TOKEN=$(gcloud auth print-access-token "${ACCOUNT_FLAG[@]}" 2>/dev/null) || {
-    echo "Error: gcloud auth failed."
-    echo "Run: gcloud auth application-default login --scopes=https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/cloud-platform"
-    exit 1
-}
+    TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null) || \
+    TOKEN=$(gcloud auth print-access-token "${ACCOUNT_FLAG[@]}" 2>/dev/null) || {
+        echo "Error: gcloud auth failed."
+        echo "Run: gcloud auth application-default login --scopes=https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/cloud-platform"
+        exit 1
+    }
 
-# Drive API requires a quota project. Honour the standard gcloud env vars
-# (CLOUDSDK_CORE_PROJECT, GOOGLE_CLOUD_PROJECT) before falling back to the
-# user's active gcloud config, so a deploy script can pin the project
-# without depending on whatever the operator's `gcloud config` happens to
-# point at.
-QUOTA_PROJECT="${CLOUDSDK_CORE_PROJECT:-${GOOGLE_CLOUD_PROJECT:-$(gcloud config get-value project 2>/dev/null || echo "")}}"
+    # Drive API requires a quota project. Honour the standard gcloud env vars
+    # (CLOUDSDK_CORE_PROJECT, GOOGLE_CLOUD_PROJECT) before falling back to the
+    # user's active gcloud config, so a deploy script can pin the project
+    # without depending on whatever the operator's `gcloud config` happens to
+    # point at.
+    QUOTA_PROJECT="${CLOUDSDK_CORE_PROJECT:-${GOOGLE_CLOUD_PROJECT:-$(gcloud config get-value project 2>/dev/null || echo "")}}"
 
-# Build common curl auth headers
-AUTH_HEADERS=(-H "Authorization: Bearer $TOKEN")
-if [[ -n "$QUOTA_PROJECT" ]]; then
-    AUTH_HEADERS+=(-H "x-goog-user-project: $QUOTA_PROJECT")
+    # Build common curl auth headers
+    AUTH_HEADERS=(-H "Authorization: Bearer $TOKEN")
+    if [[ -n "$QUOTA_PROJECT" ]]; then
+        AUTH_HEADERS+=(-H "x-goog-user-project: $QUOTA_PROJECT")
+    fi
 fi
 
 # --- Google Drive API helpers ---
@@ -239,7 +252,7 @@ resolve_folder_path() {
     echo "$current_id"
 }
 
-if [[ -n "$FOLDER_PATH" && -z "$FOLDER_ID" ]]; then
+if [[ -z "$HTML_MODE" && -n "$FOLDER_PATH" && -z "$FOLDER_ID" ]]; then
     echo "Resolving folder path: $FOLDER_PATH ..."
     FOLDER_ID=$(resolve_folder_path "$FOLDER_PATH")
     echo "  Resolved to folder ID: $FOLDER_ID"
@@ -321,14 +334,49 @@ convert_and_upload() {
     echo "  -> $doc_name: $doc_url"
 }
 
-# --- Pass 1: Upload all files ---
+convert_to_html() {
+    local md_file="$1"
+    local md_input="$2"
+
+    local bname
+    bname=$(basename "$md_file" .md)
+    local out_dir
+    out_dir=$(dirname "$md_file")
+    local html_file="${out_dir}/${bname}.html"
+
+    pandoc "$md_input" -f gfm -t html -o "$html_file" --standalone --metadata title="${bname//-/ }"
+
+    if [[ ! -f "$html_file" ]]; then
+        echo "Error: pandoc conversion failed for $md_file"
+        return 1
+    fi
+
+    local key
+    key=$(basename "$md_file")
+    # Sentinel value so pass 2's existence check passes; the real link
+    # target lives in DOC_URLS.
+    DOC_IDS["$key"]="$html_file"
+    DOC_URLS["$key"]="${bname}.html"
+
+    echo "  -> $html_file"
+}
+
+# --- Pass 1: Convert (and upload, unless --html) ---
 echo ""
-echo "Pass 1: Uploading files ..."
+if [[ -n "$HTML_MODE" ]]; then
+    echo "Pass 1: Converting files to HTML ..."
+else
+    echo "Pass 1: Uploading files ..."
+fi
 
 FAILED=0
 for md_file in "${MD_FILES[@]}"; do
     echo "  $(basename "$md_file")"
-    convert_and_upload "$md_file" "$md_file" || FAILED=$((FAILED + 1))
+    if [[ -n "$HTML_MODE" ]]; then
+        convert_to_html "$md_file" "$md_file" || FAILED=$((FAILED + 1))
+    else
+        convert_and_upload "$md_file" "$md_file" || FAILED=$((FAILED + 1))
+    fi
 done
 
 if [[ $FAILED -gt 0 ]]; then
@@ -368,10 +416,18 @@ if [[ "$NEEDS_REWRITE" == "true" ]]; then
 
         if ! diff -q "$md_file" "$rewritten" &>/dev/null; then
             echo "  $(basename "$md_file") (updating links)"
-            convert_and_upload "$md_file" "$rewritten" "$doc_id" || true
+            if [[ -n "$HTML_MODE" ]]; then
+                convert_to_html "$md_file" "$rewritten" || true
+            else
+                convert_and_upload "$md_file" "$rewritten" "$doc_id" || true
+            fi
         fi
     done
 fi
 
 echo ""
-echo "Done. ${#MD_FILES[@]} file(s) uploaded."
+if [[ -n "$HTML_MODE" ]]; then
+    echo "Done. ${#MD_FILES[@]} file(s) converted."
+else
+    echo "Done. ${#MD_FILES[@]} file(s) uploaded."
+fi

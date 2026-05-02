@@ -11,6 +11,7 @@ Run it locally or wire it into your GitHub workflows to keep your docs folder in
 - **Upsert** — if a doc with the same name already exists, it's updated in place (no duplicates)
 - **Cross-file links** — links between `.md` files (e.g. `[Setup](SETUP.md)`) are rewritten to point to the corresponding Google Doc
 - **Batch upload** — pass multiple files or use wildcards (`*.md`)
+- **HTML mode** — `--html` converts to standalone `.html` next to each input (no Drive, no gcloud required)
 
 ## Install
 
@@ -40,6 +41,9 @@ md-to-gdoc docs/*.md "My Company/Products/Docs"
 
 # Upload to a specific Drive folder by ID
 md-to-gdoc README.md --folder 1a2b3c4d5e6f
+
+# Convert to standalone HTML next to each input (no Drive upload)
+md-to-gdoc --html docs/*.md
 ```
 
 ## GitHub Actions
