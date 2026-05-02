@@ -1,8 +1,8 @@
 class MdToGdoc < Formula
   desc "Convert Markdown files to Google Docs with cross-file link rewriting"
   homepage "https://github.com/Studio-1119-Inc/md-to-gdoc"
-  url "https://github.com/Studio-1119-Inc/md-to-gdoc/archive/refs/tags/v1.3.1.tar.gz"
-  sha256 "5b9cef75886a0a6ec7119bc7f6247bdd5a875718c493b9e53aaf892bd0f18f84"
+  url "https://github.com/Studio-1119-Inc/md-to-gdoc/archive/refs/tags/v1.4.0.tar.gz"
+  sha256 "22e9f0de026cc72c623596e5cf3b3bd50a6de2f337496fe158dbf5d3a73d966f"
   license "MIT"
 
   depends_on "pandoc"
